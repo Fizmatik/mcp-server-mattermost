@@ -524,3 +524,43 @@ def test_http_host_origin_protection_rejects_unknown_value(monkeypatch):
 
     with pytest.raises(ValidationError):
         Settings()
+
+
+class TestPoolSettings:
+    def test_pool_defaults(self, monkeypatch):
+        from mcp_server_mattermost.config import Settings
+
+        monkeypatch.setenv("MATTERMOST_URL", "https://mm.example.com")
+        monkeypatch.setenv("MATTERMOST_TOKEN", "t")
+        settings = Settings()
+
+        assert settings.max_connections == 100
+        assert settings.max_keepalive_connections == 20
+        assert settings.keepalive_expiry == 5.0
+
+    def test_pool_env_override(self, monkeypatch):
+        from mcp_server_mattermost.config import Settings
+
+        monkeypatch.setenv("MATTERMOST_URL", "https://mm.example.com")
+        monkeypatch.setenv("MATTERMOST_TOKEN", "t")
+        monkeypatch.setenv("MATTERMOST_MAX_CONNECTIONS", "50")
+        monkeypatch.setenv("MATTERMOST_MAX_KEEPALIVE_CONNECTIONS", "10")
+        monkeypatch.setenv("MATTERMOST_KEEPALIVE_EXPIRY", "30")
+        settings = Settings()
+
+        assert settings.max_connections == 50
+        assert settings.max_keepalive_connections == 10
+        assert settings.keepalive_expiry == 30.0
+
+    def test_keepalive_cannot_exceed_max_connections(self, monkeypatch):
+        import pytest
+
+        from mcp_server_mattermost.config import Settings
+
+        monkeypatch.setenv("MATTERMOST_URL", "https://mm.example.com")
+        monkeypatch.setenv("MATTERMOST_TOKEN", "t")
+        monkeypatch.setenv("MATTERMOST_MAX_CONNECTIONS", "10")
+        monkeypatch.setenv("MATTERMOST_MAX_KEEPALIVE_CONNECTIONS", "20")
+
+        with pytest.raises(ValueError, match="cannot exceed"):
+            Settings()

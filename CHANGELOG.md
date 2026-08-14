@@ -8,23 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
-- Upgraded FastMCP to 3.4.4 — fixes CVE-2026-27124 (GHSA-rww4-4w9c-7733,
-  missing consent check in the OAuth proxy callback), plus CVE-2026-32871
-  (authenticated SSRF) and CVE-2025-64340 (command injection) that were
-  present in the previous 3.0.2, and includes later redirect-URI/SSRF/
-  DNS-rebinding hardening; dependency floor raised to `fastmcp>=3.4,<4`.
-- Remediated 20 known advisories (8 HIGH, 9 MEDIUM, 3 LOW) in transitive and
-  dev/docs dependencies by upgrading them to fixed versions: `cryptography`,
-  `pyjwt`, `mcp`, `urllib3`, `pydantic-settings`, `requests`, `idna`,
-  `pytest`, `pygments`, `pymdown-extensions`.
-- Added a blocking SCA gate: Trivy scans `uv.lock` on every PR and push to
-  main and fails on *fixable* HIGH/CRITICAL vulnerabilities, matching the
-  per-architecture image scan. Fixable LOW/MEDIUM are reported (CI log, plus
-  the Security tab on main) but do not block; vulnerabilities with no fix
-  available are reported but never block. Every published image architecture
-  (amd64, arm64) is built and scanned before the manifest is pushed (fails on
-  fixable HIGH/CRITICAL). Exceptions only via `.trivyignore` with a documented
-  reason and review date.
+- Upgraded FastMCP to 3.4.4 — fixes CVE-2026-27124 (GHSA-rww4-4w9c-7733, missing consent check in the
+  OAuth proxy callback), plus CVE-2026-32871 (authenticated SSRF) and CVE-2025-64340 (command injection)
+  present in the previous 3.0.2. Floor raised to `fastmcp>=3.4.4,<4`; 3.4.3 is the first release with the
+  Host/Origin protection this transport relies on.
+- Remediated 20 known advisories (8 HIGH, 9 MEDIUM, 3 LOW) in transitive and dev/docs dependencies:
+  `cryptography`, `pyjwt`, `mcp`, `urllib3`, `pydantic-settings`, `requests`, `idna`, `pytest`,
+  `pygments`, `pymdown-extensions`.
+- Added a blocking SCA gate: Trivy scans `uv.lock` and every published image architecture, failing on
+  *fixable* HIGH/CRITICAL. Fixable LOW/MEDIUM are reported but do not block, as are vulnerabilities with
+  no fix available. Exceptions only via `.trivyignore` with a documented reason and review date.
+- `static_token` over HTTP now warns at startup instead of refusing to start — louder on a non-loopback
+  bind, where the unauthenticated endpoint acting with the shared token is reachable by network peers.
+  Container upgrades are no longer broken by this check.
+- Added opt-in DNS-rebinding protection via `MATTERMOST_HTTP_HOST_ORIGIN_PROTECTION`
+  (`off` / `auto` / `strict`), with `MATTERMOST_HTTP_ALLOWED_HOSTS` / `MATTERMOST_HTTP_ALLOWED_ORIGINS`
+  allowlists. **Off unless set**, so upgrading rejects nothing that worked before, and FastMCP's own
+  `FASTMCP_HTTP_HOST_ORIGIN_PROTECTION` still applies. Configured through FastMCP's settings rather than
+  `mcp.run()` kwargs, so it also covers `fastmcp run`, a standalone ASGI server, and the app mounted into
+  a parent application — previously none of those were protected. Rejections are logged with the
+  offending `Host`/`Origin` and the variable that would accept it. See
+  [HTTP transport security](docs/configuration.md#http-transport-security).
+
+### Deprecated
+- Host/Origin protection defaults to off; **in 1.0.0 the default becomes `auto`** (#30). Set
+  `MATTERMOST_HTTP_HOST_ORIGIN_PROTECTION` explicitly now — `=off` included — and that upgrade changes
+  nothing for you.
+
+### Fixed
+- Allowlists accept bracketed IPv6 literals (`[::1]`), which previously aborted startup with a JSON
+  parser error; a value reducing to an empty list is now treated as unset rather than as an allowlist
+  matching nothing.
+- Raised the `pydantic-settings` floor to `>=2.7`. The declared `>=2.0` allowed versions without
+  `NoDecode`, where the package failed to import at all — on stdio as well as HTTP.
 
 ## [0.5.1] - 2026-07-07
 

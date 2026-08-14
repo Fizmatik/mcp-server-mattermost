@@ -422,3 +422,105 @@ class TestAuthModeSettings:
             pytest.raises(ValidationError, match="MATTERMOST_OAUTH_CALLBACK_PATH must start with '/'"),
         ):
             Settings()
+
+
+def test_http_security_settings_defaults(monkeypatch):
+    monkeypatch.setenv("MATTERMOST_URL", "https://example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "test-token")
+
+    from mcp_server_mattermost.config import Settings
+
+    settings = Settings()
+    assert settings.http_allowed_hosts is None
+    assert settings.http_allowed_origins is None
+
+
+def test_http_allowed_hosts_parses_csv(monkeypatch):
+    monkeypatch.setenv("MATTERMOST_URL", "https://example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "test-token")
+    monkeypatch.setenv("MATTERMOST_HTTP_ALLOWED_HOSTS", "a.example, b.example ,,")
+
+    from mcp_server_mattermost.config import Settings
+
+    settings = Settings()
+    assert settings.http_allowed_hosts == ["a.example", "b.example"]
+
+
+def test_http_allowed_origins_parses_json(monkeypatch):
+    monkeypatch.setenv("MATTERMOST_URL", "https://example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "test-token")
+    monkeypatch.setenv("MATTERMOST_HTTP_ALLOWED_ORIGINS", '["https://x.example","https://y.example"]')
+
+    from mcp_server_mattermost.config import Settings
+
+    settings = Settings()
+    assert settings.http_allowed_origins == ["https://x.example", "https://y.example"]
+
+
+def test_http_allowed_hosts_blank_is_none(monkeypatch):
+    monkeypatch.setenv("MATTERMOST_URL", "https://example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "test-token")
+    monkeypatch.setenv("MATTERMOST_HTTP_ALLOWED_HOSTS", "   ")
+
+    from mcp_server_mattermost.config import Settings
+
+    settings = Settings()
+    assert settings.http_allowed_hosts is None
+
+
+@pytest.mark.parametrize("raw", ["[]", ",", " , ", "[ ]"])
+def test_http_allowlist_empty_result_is_none(monkeypatch, raw):
+    """An empty list is not neutral: FastMCP treats it as an explicit allowlist matching nothing."""
+    monkeypatch.setenv("MATTERMOST_URL", "https://example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "test-token")
+    monkeypatch.setenv("MATTERMOST_HTTP_ALLOWED_HOSTS", raw)
+
+    from mcp_server_mattermost.config import Settings
+
+    assert Settings().http_allowed_hosts is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("[::1]", ["[::1]"]),
+        ("[::1],127.0.0.1", ["[::1]", "127.0.0.1"]),
+        ("[2001:db8::1]:8000", ["[2001:db8::1]:8000"]),
+        ('["[::1]"]', ["[::1]"]),
+    ],
+)
+def test_http_allowlist_accepts_bracketed_ipv6(monkeypatch, raw, expected):
+    """A bracketed IPv6 literal is the canonical Host spelling and is not valid JSON."""
+    monkeypatch.setenv("MATTERMOST_URL", "https://example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "test-token")
+    monkeypatch.setenv("MATTERMOST_HTTP_ALLOWED_HOSTS", raw)
+
+    from mcp_server_mattermost.config import Settings
+
+    assert Settings().http_allowed_hosts == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("off", "off"), ("AUTO", "auto"), (" strict ", "strict"), ("", None)],
+)
+def test_http_host_origin_protection_parsing(monkeypatch, raw, expected):
+    monkeypatch.setenv("MATTERMOST_URL", "https://example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "test-token")
+    monkeypatch.setenv("MATTERMOST_HTTP_HOST_ORIGIN_PROTECTION", raw)
+
+    from mcp_server_mattermost.config import Settings
+
+    value = Settings().http_host_origin_protection
+    assert (value.value if value else None) == expected
+
+
+def test_http_host_origin_protection_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("MATTERMOST_URL", "https://example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "test-token")
+    monkeypatch.setenv("MATTERMOST_HTTP_HOST_ORIGIN_PROTECTION", "on")
+
+    from mcp_server_mattermost.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings()

@@ -52,13 +52,11 @@ def mock_client_rate_limited() -> AsyncMock:
 def make_post_data(
     post_id: str = "ps1234567890123456789012",
     message: str = "Hello, World!",
+    omit: tuple[str, ...] = (),
     **overrides,
 ) -> dict:
-    """Create full post mock data.
-
-    Most Post fields are required (no omitempty per Mattermost Go source).
-    """
-    return {
+    """Create full post mock data. Pass `omit` to drop keys the server may not send."""
+    data = {
         "id": post_id,
         "create_at": 1706400000000,
         "update_at": 1706400000000,
@@ -76,6 +74,9 @@ def make_post_data(
         "is_pinned": False,
         **overrides,
     }
+    for key in omit:
+        data.pop(key, None)
+    return data
 
 
 def make_post_list_data(

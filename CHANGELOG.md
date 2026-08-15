@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Post.file_ids` defaults to an empty list — Mattermost ≤ v10.4.0 omits the key on posts
   without attachments, which broke parsing in every tool that returns posts
   ([#27](https://github.com/cloud-ru-tech/mcp-server-mattermost/issues/27))
+- Allowlists accept bracketed IPv6 literals (`[::1]`), which previously aborted startup with a JSON
+  parser error; a value reducing to an empty list is now treated as unset rather than as an allowlist
+  matching nothing.
+- Raised the `pydantic-settings` floor to `>=2.7`. The declared `>=2.0` allowed versions without
+  `NoDecode`, where the package failed to import at all — on stdio as well as HTTP.
 
 ### Security
 - The shared HTTP pool is transport-only: its cookie jar is disabled, so a
@@ -57,13 +62,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Host/Origin protection defaults to off; **in 1.0.0 the default becomes `auto`** (#30). Set
   `MATTERMOST_HTTP_HOST_ORIGIN_PROTECTION` explicitly now — `=off` included — and that upgrade changes
   nothing for you.
-
-### Fixed
-- Allowlists accept bracketed IPv6 literals (`[::1]`), which previously aborted startup with a JSON
-  parser error; a value reducing to an empty list is now treated as unset rather than as an allowlist
-  matching nothing.
-- Raised the `pydantic-settings` floor to `>=2.7`. The declared `>=2.0` allowed versions without
-  `NoDecode`, where the package failed to import at all — on stdio as well as HTTP.
 
 ## [0.5.1] - 2026-07-07
 

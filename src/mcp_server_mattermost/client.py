@@ -1,6 +1,7 @@
 """Async HTTP client for Mattermost API v4."""
 
 import asyncio
+import tempfile
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -14,8 +15,12 @@ from tenacity import RetryCallState, retry, retry_if_exception, stop_after_attem
 
 from .config import Settings
 from .constants import UPDATE_BOOKMARK_RESPONSE_KEY
-from .exceptions import AuthenticationError, MattermostAPIError, NotFoundError, RateLimitError
+from .exceptions import AuthenticationError, FileValidationError, MattermostAPIError, NotFoundError, RateLimitError
 from .logging import logger, request_id_var
+
+
+# Mattermost's default FileSettings.MaxFileSize is 100 MB; refuse to buffer anything larger.
+MAX_DOWNLOAD_SIZE_BYTES = 100 * 1024 * 1024
 
 
 _F = TypeVar("_F", bound=Callable[..., Any])
@@ -225,14 +230,11 @@ class MattermostClient:
 
         return None
 
-    def _handle_response(self, response: httpx.Response) -> dict[str, Any] | list[Any] | None:
-        """Handle HTTP response and map errors to exceptions.
+    def _raise_for_error(self, response: httpx.Response) -> None:
+        """Map an error HTTP status to the matching exception; return on success.
 
         Args:
             response: HTTP response from API
-
-        Returns:
-            Parsed JSON body or None for empty responses
 
         Raises:
             AuthenticationError: If authentication failed (401)
@@ -261,6 +263,23 @@ class MattermostClient:
             message, error_id = self._parse_error_response(response)
             msg = f"Client error: {message}"
             raise MattermostAPIError(msg, status_code=response.status_code, error_id=error_id)
+
+    def _handle_response(self, response: httpx.Response) -> dict[str, Any] | list[Any] | None:
+        """Handle HTTP response and map errors to exceptions.
+
+        Args:
+            response: HTTP response from API
+
+        Returns:
+            Parsed JSON body or None for empty responses
+
+        Raises:
+            AuthenticationError: If authentication failed (401)
+            NotFoundError: If resource not found (404)
+            RateLimitError: If rate limited (429)
+            MattermostAPIError: For other API errors (4xx, 5xx)
+        """
+        self._raise_for_error(response)
 
         if not response.content:
             return None
@@ -1148,6 +1167,102 @@ class MattermostClient:
         """
         result = await self.get(f"/files/{file_id}/link")
         return result if isinstance(result, dict) else {}
+
+    async def download_file(
+        self,
+        file_id: str,
+        destination_dir: str,
+        filename: str | None = None,
+        *,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Download a file attachment and save it under a local directory.
+
+        The file's metadata is fetched first to learn its name and size; the
+        content is then written atomically (temp file + rename) into
+        ``destination_dir``. Only the base name is ever used, so a server-side
+        name like ``../x`` cannot escape the directory.
+
+        Args:
+            file_id: File identifier
+            destination_dir: Local directory to save into (created if missing)
+            filename: Override the saved file name (defaults to the server-side name)
+            overwrite: Replace an existing file with the same name
+
+        Returns:
+            Dict with ``file_id``, ``path``, ``name``, ``size`` and ``mime_type``
+
+        Raises:
+            FileValidationError: If the destination or name is invalid, the file is
+                too large, or the target exists and ``overwrite`` is false
+        """
+        target_dir = Path(destination_dir)
+        if target_dir.is_symlink():  # noqa: ASYNC240 — CPU-bound stat check, not blocking I/O
+            raise FileValidationError(destination_dir, "Symbolic links are not allowed")
+        try:
+            resolved_dir = target_dir.resolve()  # noqa: ASYNC240 — CPU-bound path resolution, not blocking I/O
+            await asyncio.to_thread(resolved_dir.mkdir, parents=True, exist_ok=True)
+        except OSError as e:
+            raise FileValidationError(destination_dir, f"Cannot use destination directory: {e}") from e
+        if not resolved_dir.is_dir():
+            raise FileValidationError(destination_dir, "Destination is not a directory")
+
+        info = await self.get_file_info(file_id)
+        size = int(info.get("size") or 0)
+        if size > MAX_DOWNLOAD_SIZE_BYTES:
+            msg = f"File is {size} bytes, larger than the {MAX_DOWNLOAD_SIZE_BYTES} byte download limit"
+            raise FileValidationError(file_id, msg)
+
+        raw_name = filename or str(info.get("name") or "")
+        name = Path(raw_name).name
+        if not name or name in {".", ".."}:
+            raise FileValidationError(raw_name, "Invalid file name")
+
+        target = resolved_dir / name
+        if target.exists() and not overwrite:
+            raise FileValidationError(str(target), "File already exists (pass overwrite=True to replace it)")
+
+        content = await self._download_file_with_retry(file_id)
+        if len(content) > MAX_DOWNLOAD_SIZE_BYTES:
+            msg = f"Downloaded {len(content)} bytes, larger than the {MAX_DOWNLOAD_SIZE_BYTES} byte download limit"
+            raise FileValidationError(file_id, msg)
+
+        def _write() -> None:
+            with tempfile.NamedTemporaryFile(dir=resolved_dir, prefix=f".{name}.", delete=False) as tmp:
+                tmp.write(content)
+                tmp_path = Path(tmp.name)
+            tmp_path.replace(target)
+
+        await asyncio.to_thread(_write)
+
+        return {
+            "file_id": file_id,
+            "path": str(target),
+            "name": name,
+            "size": len(content),
+            "mime_type": str(info.get("mime_type") or ""),
+        }
+
+    async def _download_file_with_retry(self, file_id: str) -> bytes:
+        """Fetch raw file content with the same retry policy as other requests.
+
+        Args:
+            file_id: File identifier
+
+        Returns:
+            File content as bytes
+        """
+        retrying = self._make_retrying()
+
+        @retrying
+        async def _do_download() -> bytes:
+            self._log_http_request("GET", f"/files/{file_id}")
+            response = await self._http.get(f"/files/{file_id}")
+            self._log_http_response(response.status_code)
+            self._raise_for_error(response)
+            return response.content
+
+        return await _do_download()
 
     # === Bookmarks API ===
 

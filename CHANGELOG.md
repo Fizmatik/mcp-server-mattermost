@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `download_file` tool: saves a file attachment to a local directory by its ID, the counterpart of
+  `upload_file`. Uses only the base name of the file, writes atomically, refuses files over 100 MB and
+  never overwrites an existing file unless asked to
+
 ### Fixed
 - `upload_file` stored the whole multipart envelope as the file content: the client-wide
   `Content-Type: application/json` header overrode the `multipart/form-data` one httpx sets for

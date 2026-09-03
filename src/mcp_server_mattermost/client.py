@@ -106,7 +106,11 @@ class MattermostClient:
         """
         raw = self._token_override if self._token_override is not None else (self.settings.token or "")
         effective_token = raw.strip()
-        headers: dict[str, str] = {"Content-Type": "application/json"}
+        # No client-wide Content-Type: httpx sets ``application/json`` for ``json=``
+        # requests and ``multipart/form-data; boundary=...`` for ``files=`` uploads.
+        # A fixed header here overrode the multipart one, and Mattermost then stored
+        # the whole multipart envelope as the uploaded file's content.
+        headers: dict[str, str] = {}
         if effective_token:
             headers["Authorization"] = f"Bearer {effective_token}"
             logger.info("Initializing Mattermost API client")

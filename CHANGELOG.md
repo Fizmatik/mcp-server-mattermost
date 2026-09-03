@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `upload_file` stored the whole multipart envelope as the file content: the client-wide
+  `Content-Type: application/json` header overrode the `multipart/form-data` one httpx sets for
+  `files=`, and Mattermost fell back to its raw-body upload mode
+  ([#34](https://github.com/cloud-ru-tech/mcp-server-mattermost/issues/34))
 - `Post.file_ids` defaults to an empty list — Mattermost ≤ v10.4.0 omits the key on posts
   without attachments, which broke parsing in every tool that returns posts
   ([#27](https://github.com/cloud-ru-tech/mcp-server-mattermost/issues/27))

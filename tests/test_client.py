@@ -1938,6 +1938,59 @@ class TestMattermostClientFilesAPI:
         assert file_content.encode() in request_bodies[1]
 
     @pytest.mark.asyncio
+    @respx.mock
+    async def test_upload_file_sends_multipart_content_type(self, mock_settings, tmp_path):
+        """upload_file() must send a multipart/form-data Content-Type, not the client default.
+
+        Mattermost falls back to its raw-body upload mode when the request is not
+        multipart and channel_id/filename are given as query parameters. With the
+        client-wide ``application/json`` header the whole multipart envelope was
+        stored as the file content.
+        """
+        captured: list[httpx.Request] = []
+
+        def capture_request(request):
+            captured.append(request)
+            return httpx.Response(201, json={"file_infos": [{"id": "file123"}]})
+
+        respx.post("https://test.mattermost.com/api/v4/files").mock(side_effect=capture_request)
+
+        temp_file = tmp_path / "test.txt"
+        temp_file.write_text("multipart content type test")
+
+        from mcp_server_mattermost.config import get_settings
+
+        client = MattermostClient(get_settings())
+        async with client.lifespan():
+            await client.upload_file("ch123", str(temp_file))
+
+        assert len(captured) == 1
+        content_type = captured[0].headers["content-type"]
+        assert content_type.startswith("multipart/form-data; boundary="), content_type
+        assert captured[0].content.startswith(b"--"), "body must be a multipart envelope"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_json_requests_still_send_json_content_type(self, mock_settings):
+        """Dropping the client-wide header must not lose Content-Type on JSON requests."""
+        captured: list[httpx.Request] = []
+
+        def capture_request(request):
+            captured.append(request)
+            return httpx.Response(201, json={"id": "post123", "message": "hi"})
+
+        respx.post("https://test.mattermost.com/api/v4/posts").mock(side_effect=capture_request)
+
+        from mcp_server_mattermost.config import get_settings
+
+        client = MattermostClient(get_settings())
+        async with client.lifespan():
+            await client.post("/posts", json={"channel_id": "ch123", "message": "hi"})
+
+        assert len(captured) == 1
+        assert captured[0].headers["content-type"] == "application/json"
+
+    @pytest.mark.asyncio
     async def test_relative_path_resolved(self, mock_settings, tmp_path, monkeypatch):
         """Verify relative paths are resolved correctly."""
         from pathlib import Path

@@ -16,6 +16,7 @@ class TestGetClient:
             async with get_client() as client:
                 assert isinstance(client, MattermostClient)
                 assert client._token_override is None
+                assert client._borrowed_client is not None
 
     @pytest.mark.asyncio
     async def test_client_token_uses_access_token_claims(self, mock_settings_allow_http: None) -> None:
@@ -103,3 +104,29 @@ class TestGetClient:
                 assert client._token_override == "from-oauth-proxy"
 
         get_settings.cache_clear()
+
+    @pytest.mark.asyncio
+    async def test_works_without_any_fastmcp_context(self, mock_settings: None) -> None:
+        """Library use: no FastMCP server, no request context, still a working client."""
+        import respx
+        from httpx import Response
+
+        from mcp_server_mattermost.deps import get_client
+
+        with respx.mock:
+            route = respx.get("https://test.mattermost.com/api/v4/users/me").mock(
+                return_value=Response(200, json={"id": "u1"}),
+            )
+            async with get_client() as client:
+                assert await client.get_me() == {"id": "u1"}
+            assert route.called
+
+    @pytest.mark.asyncio
+    async def test_successive_calls_share_one_pool(self, mock_settings: None) -> None:
+        """Two independent get_client scopes borrow the same underlying pool."""
+        from mcp_server_mattermost.deps import get_client
+
+        async with get_client() as first:
+            first_pool = first._borrowed_client
+        async with get_client() as second:
+            assert second._borrowed_client is first_pool

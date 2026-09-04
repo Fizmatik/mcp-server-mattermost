@@ -63,6 +63,10 @@ class Settings(BaseSettings):
         MATTERMOST_OAUTH_MATTERMOST_PUBLIC_URL: Browser-facing Mattermost URL
         MATTERMOST_TIMEOUT: Request timeout in seconds (default: 30)
         MATTERMOST_MAX_RETRIES: Max retry attempts (default: 3)
+        MATTERMOST_MAX_CONNECTIONS: Max HTTP connections in the shared pool (default: 100)
+        MATTERMOST_MAX_KEEPALIVE_CONNECTIONS: Max idle keepalive connections (default: 20, clamped
+            to MATTERMOST_MAX_CONNECTIONS when only the latter is set)
+        MATTERMOST_KEEPALIVE_EXPIRY: Idle keepalive connection lifetime in seconds (default: 30.0)
         MATTERMOST_VERIFY_SSL: Verify SSL certificates (default: true)
         MATTERMOST_EXTRA_CA_CERTS: Path to PEM file with additional trusted CAs
         MATTERMOST_LOG_LEVEL: Logging level (default: INFO)
@@ -89,6 +93,18 @@ class Settings(BaseSettings):
     )
     timeout: int = Field(default=30, ge=1, le=300, description="Request timeout in seconds")
     max_retries: int = Field(default=3, ge=0, le=10, description="Maximum retry attempts")
+    max_connections: int = Field(default=100, ge=1, le=1000, description="Max HTTP connections in the shared pool")
+    max_keepalive_connections: int = Field(
+        default=20, ge=0, le=1000, description="Max idle keepalive connections in the shared pool"
+    )
+    keepalive_expiry: float = Field(
+        # 30s rather than httpx's 5s: an agent typically spends 5-30s thinking
+        # between two tool calls, and at 5s every one of them redials.
+        default=30.0,
+        ge=0,
+        le=600,
+        description="Seconds an idle keepalive connection stays in the pool",
+    )
     verify_ssl: bool = Field(default=True, description="Verify SSL certificates")
     extra_ca_certs: str | None = Field(
         default=None,
@@ -245,6 +261,21 @@ class Settings(BaseSettings):
         if self.auth_mode is AuthMode.OAUTH_PROXY:
             self._validate_oauth_proxy()
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_pool_limits(self) -> "Settings":
+        """Keepalive connections cannot exceed the total connection cap.
+
+        Lowering only MATTERMOST_MAX_CONNECTIONS below the keepalive default is
+        not a misconfiguration — the operator never named that variable — so it
+        clamps. Only a conflict the operator actually wrote is an error.
+        """
+        if self.max_keepalive_connections > self.max_connections:
+            if "max_keepalive_connections" in self.model_fields_set:
+                msg = "MATTERMOST_MAX_KEEPALIVE_CONNECTIONS cannot exceed MATTERMOST_MAX_CONNECTIONS"
+                raise ValueError(msg)
+            self.max_keepalive_connections = self.max_connections
         return self
 
     def _validate_oauth_proxy(self) -> None:

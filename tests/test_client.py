@@ -2179,16 +2179,16 @@ class TestMattermostClientFilesAPI:
     @pytest.mark.asyncio
     @respx.mock
     async def test_upload_file_sends_multipart_content_type(self, mock_settings, tmp_path):
-        """upload_file() must send a multipart/form-data Content-Type, not the client default.
+        """upload_file() must send a multipart/form-data Content-Type, not a JSON one.
 
         Mattermost falls back to its raw-body upload mode when the request is not
-        multipart and channel_id/filename are given as query parameters. With the
-        client-wide ``application/json`` header the whole multipart envelope was
-        stored as the file content.
+        multipart and channel_id/filename are given as query parameters, storing the
+        whole multipart envelope as the file's content (#34). Regression guard for the
+        deliberate omission of Content-Type on the upload path.
         """
         captured: list[httpx.Request] = []
 
-        def capture_request(request):
+        def capture_request(request: httpx.Request) -> httpx.Response:
             captured.append(request)
             return httpx.Response(201, json={"file_infos": [{"id": "file123"}]})
 
@@ -2211,10 +2211,10 @@ class TestMattermostClientFilesAPI:
     @pytest.mark.asyncio
     @respx.mock
     async def test_json_requests_still_send_json_content_type(self, mock_settings):
-        """Dropping the client-wide header must not lose Content-Type on JSON requests."""
+        """Omitting Content-Type on uploads must not drop it from JSON requests."""
         captured: list[httpx.Request] = []
 
-        def capture_request(request):
+        def capture_request(request: httpx.Request) -> httpx.Response:
             captured.append(request)
             return httpx.Response(201, json={"id": "post123", "message": "hi"})
 

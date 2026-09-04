@@ -49,7 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - File uploads now send the correct `multipart/form-data` Content-Type. The
   client previously carried a default `Content-Type: application/json` header
-  that httpx did not override for multipart requests. Every other request is
+  that httpx did not override for multipart requests. Mattermost then fell back
+  to its raw-body upload mode and stored the whole multipart envelope as the
+  file's content, so every file uploaded through `upload_file` up to and
+  including 0.5.1 came back corrupted, with no error to signal it
+  ([#34](https://github.com/cloud-ru-tech/mcp-server-mattermost/issues/34),
+  reported by [@Fizmatik](https://github.com/Fizmatik)). Every other request is
   unchanged and still sends `application/json`.
 - A second, still-open session no longer breaks when the first one disconnects.
   FastMCP closes a server's lifespan stack on the first session's exit without

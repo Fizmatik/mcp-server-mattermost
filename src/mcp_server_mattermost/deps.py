@@ -8,6 +8,7 @@ from fastmcp.server.dependencies import get_access_token
 from .client import MattermostClient
 from .config import AuthMode, get_settings
 from .exceptions import AuthenticationError
+from .http_pool import shared_http_client
 
 
 def _get_mattermost_token_from_auth_context() -> str:
@@ -26,10 +27,15 @@ def _get_mattermost_token_from_auth_context() -> str:
 
 @asynccontextmanager
 async def get_client() -> AsyncIterator[MattermostClient]:
-    """Provide Mattermost client with automatic lifecycle management.
+    """Provide a Mattermost client bound to the process-wide shared HTTP pool.
+
+    The pool comes from ``http_pool``, not from the FastMCP lifespan context, so
+    these tools also work when imported into another server or driven directly
+    as a library. The per-request token is attached by ``MattermostClient``; it
+    is never stored in the shared client.
 
     Yields:
-        MattermostClient ready for API calls
+        MattermostClient ready for API calls.
     """
     settings = get_settings()
     token: str | None = None
@@ -37,6 +43,7 @@ async def get_client() -> AsyncIterator[MattermostClient]:
     if settings.auth_mode in {AuthMode.CLIENT_TOKEN, AuthMode.OAUTH_PROXY}:
         token = _get_mattermost_token_from_auth_context()
 
-    client = MattermostClient(settings, token=token)
-    async with client.lifespan():
-        yield client
+    async with shared_http_client(settings) as http_client:
+        client = MattermostClient(settings, token=token, http_client=http_client)
+        async with client.lifespan():
+            yield client

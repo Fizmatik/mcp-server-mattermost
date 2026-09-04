@@ -2408,6 +2408,48 @@ class TestMattermostClientFileDownload:
         assert content_route.call_count == 2
         assert result["size"] == 11
 
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_file_sends_authorization_header(self, mock_settings, tmp_path):
+        """The content fetch must carry the per-request bearer token.
+
+        The shared pool deliberately holds no default ``Authorization`` header so
+        that one pool can serve several users; a download that talked to httpx
+        directly would go out unauthenticated and get a 401. Regression guard.
+        """
+        captured: list[httpx.Request] = []
+
+        def capture_request(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(200, content=b"%PDF-1.4 ok")
+
+        respx.get(self.INFO_URL).mock(return_value=httpx.Response(200, json=self._info()))
+        respx.get(self.CONTENT_URL).mock(side_effect=capture_request)
+
+        settings = Settings(url="https://test.mattermost.com", token="test-token-12345")
+        async with MattermostClient(settings).lifespan() as client:
+            await client.download_file(self.FILE_ID, str(tmp_path))
+
+        assert len(captured) == 1
+        assert captured[0].headers["authorization"] == "Bearer test-token-12345"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_file_reports_pool_exhaustion(self, mock_settings, tmp_path):
+        """A pool timeout must surface as ConnectionPoolTimeoutError, not an upstream one.
+
+        The download path has to go through ``_send`` for that translation to
+        happen; talking to httpx directly reports a misleading upstream timeout.
+        """
+        from mcp_server_mattermost.exceptions import ConnectionPoolTimeoutError
+
+        respx.get(self.INFO_URL).mock(return_value=httpx.Response(200, json=self._info()))
+        respx.get(self.CONTENT_URL).mock(side_effect=httpx.PoolTimeout("pool is full"))
+
+        async with self._client().lifespan() as client:
+            with pytest.raises(ConnectionPoolTimeoutError):
+                await client.download_file(self.FILE_ID, str(tmp_path))
+
 
 class TestCreateDirectChannel:
     """Tests for create_direct_channel client method."""

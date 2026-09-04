@@ -1412,18 +1412,26 @@ class MattermostClient:
     async def _download_file_with_retry(self, file_id: str) -> bytes:
         """Fetch raw file content with the same retry policy as other requests.
 
+        Goes through ``_send`` rather than the httpx client directly, so an
+        exhausted pool is reported as ``ConnectionPoolTimeoutError`` and not as
+        an upstream timeout. The bearer token travels in the per-request header
+        because the pool may be shared with other users.
+
         Args:
             file_id: File identifier
 
         Returns:
             File content as bytes
+
+        Raises:
+            ConnectionPoolTimeoutError: If no pooled connection came free in time
         """
-        retrying = self._make_retrying()
+        retrying = self._make_retrying("GET")
 
         @retrying
         async def _do_download() -> bytes:
             self._log_http_request("GET", f"/files/{file_id}")
-            response = await self._http.get(f"/files/{file_id}")
+            response = await self._send("GET", f"/files/{file_id}", headers=self._auth_headers)
             self._log_http_response(response.status_code)
             self._raise_for_error(response)
             return response.content

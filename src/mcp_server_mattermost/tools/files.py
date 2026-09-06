@@ -19,7 +19,7 @@ from mcp_server_mattermost.models import ChannelId, FileDownloadResponse, FileId
 )
 async def upload_file(
     channel_id: ChannelId,
-    file_path: Annotated[str, Field(description="Local path to the file to upload")],
+    file_path: Annotated[str, Field(description="Local path to the file to upload; a leading '~' is expanded")],
     filename: Annotated[str | None, Field(description="Override filename")] = None,
     client: MattermostClient = Depends(get_client),  # noqa: B008
 ) -> FileUploadResponse:
@@ -73,13 +73,19 @@ async def get_file_link(
 
 
 @tool(
-    annotations={"readOnlyHint": True, "idempotentHint": True},
+    # A read on the Mattermost side, but a write on the host's: it creates directories
+    # and puts a file on local disk. ``capability`` is the project's access-control axis
+    # (docs/building-agents.md), so WRITE is what keeps this out of a reader profile.
+    annotations={"destructiveHint": False},
     tags={ToolTag.MATTERMOST, ToolTag.FILE},
-    meta={"capability": Capability.READ},
+    meta={"capability": Capability.WRITE},
 )
 async def download_file(
     file_id: FileId,
-    destination_dir: Annotated[str, Field(description="Local directory to save the file into (created if missing)")],
+    destination_dir: Annotated[
+        str,
+        Field(description="Local directory to save the file into (created if missing); a leading '~' is expanded"),
+    ],
     filename: Annotated[str | None, Field(description="Override the saved file name")] = None,
     overwrite: Annotated[bool, Field(description="Replace an existing file with the same name")] = False,  # noqa: FBT002
     client: MattermostClient = Depends(get_client),  # noqa: B008

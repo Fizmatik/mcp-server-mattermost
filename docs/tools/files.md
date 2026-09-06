@@ -29,7 +29,7 @@ Returns file ID that can be used when posting messages with file_ids parameter.
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
 | `channel_id` | string | ✓ | — | Channel ID to upload to |
-| `file_path` | string | ✓ | — | Local path to the file to upload |
+| `file_path` | string | ✓ | — | Local path to the file to upload; a leading `~` is expanded |
 | `filename` | string | — | — | Override filename (uses original name if not specified) |
 
 ### Returns
@@ -135,16 +135,19 @@ processed further. Only the base name of the file is used, the write is atomic
 
 | Hint | Value |
 |------|-------|
-| `readOnlyHint` | true |
-| `idempotentHint` | true |
-| `capability` | read |
+| `destructiveHint` | false |
+| `capability` | write |
+
+A read on the Mattermost side, but it writes to the host filesystem, so it is
+declared as a write — a reader profile does not get it. Nothing is destroyed
+unless `overwrite` is set.
 
 ### Parameters
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
 | `file_id` | string | ✓ | — | File ID (26-character alphanumeric) |
-| `destination_dir` | string | ✓ | — | Local directory to save into (created if missing) |
+| `destination_dir` | string | ✓ | — | Local directory to save into (created if missing); a leading `~` is expanded |
 | `filename` | string | — | server-side name | Override the saved file name |
 | `overwrite` | boolean | — | false | Replace an existing file with the same name |
 

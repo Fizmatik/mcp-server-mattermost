@@ -6,7 +6,7 @@
 
 Let AI assistants read, search, and post in your Mattermost workspace
 
-38 tools · Channels · Messages · Reactions · Threads · Files · Users
+39 tools · Channels · Messages · Reactions · Threads · Files · Users
 
 [![MCP Server](https://img.shields.io/badge/MCP-Server-blue)](https://modelcontextprotocol.io/)
 [![PyPI version](https://badge.fury.io/py/mcp-server-mattermost.svg)](https://pypi.org/project/mcp-server-mattermost/)

@@ -47,7 +47,7 @@ EXPECTED_CAPABILITIES: dict[str, Capability] = {
     "upload_file": Capability.WRITE,
     "get_file_info": Capability.READ,
     "get_file_link": Capability.READ,
-    "download_file": Capability.READ,
+    "download_file": Capability.WRITE,
     # bookmarks.py
     "list_bookmarks": Capability.READ,
     "create_bookmark": Capability.WRITE,
@@ -190,7 +190,7 @@ class TestCapabilityCounts:
         counts: dict[Capability, int] = {}
         for cap in EXPECTED_CAPABILITIES.values():
             counts[cap] = counts.get(cap, 0) + 1
-        assert counts[Capability.READ] == 21
-        assert counts[Capability.WRITE] == 14
+        assert counts[Capability.READ] == 20
+        assert counts[Capability.WRITE] == 15
         assert counts[Capability.CREATE] == 2
         assert counts[Capability.DELETE] == 2

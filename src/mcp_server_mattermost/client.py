@@ -27,8 +27,15 @@ from .exceptions import (
 from .logging import logger, request_id_var
 
 
-# Mattermost's default FileSettings.MaxFileSize is 100 MB; refuse to buffer anything larger.
+# Mattermost's default FileSettings.MaxFileSize is 100 MB; refuse anything larger. This
+# bounds what is written to disk, not what is held in memory: the response body is read in
+# full before the size can be re-checked, so the post-fetch check is defence in depth
+# against a server that misreports ``size``, not a guarantee about allocation.
 MAX_DOWNLOAD_SIZE_BYTES = 100 * 1024 * 1024
+
+# How much of a file's name goes into its temp file's prefix. Bounded so the prefix plus
+# tempfile's random suffix stays well inside NAME_MAX (255) for a long attachment name.
+_TEMP_PREFIX_MAX_CHARS = 100
 
 
 _F = TypeVar("_F", bound=Callable[..., Any])
@@ -109,6 +116,47 @@ def _wait_for_rate_limit(retry_state: RetryCallState) -> float:
 
     # Otherwise use exponential backoff: 1s, 2s, 4s, 8s... (max 10s)
     return float(wait_exponential(multiplier=1, min=1, max=10)(retry_state))
+
+
+def _write_atomically(content: bytes, target: Path, *, overwrite: bool) -> None:
+    """Write bytes to ``target`` via a temp file in the same directory, leaving no debris.
+
+    Blocking; call it through ``asyncio.to_thread``.
+
+    Args:
+        content: Bytes to write.
+        target: Final path. Its parent must exist and is where the temp file is created,
+            so the two always share a filesystem.
+        overwrite: Replace ``target`` if it exists. When false, an existing target is an
+            error rather than something to clobber.
+
+    Raises:
+        FileExistsError: If ``target`` exists and ``overwrite`` is false.
+        OSError: If the write or the rename fails.
+    """
+    tmp_path: Path | None = None
+    try:
+        # The prefix is truncated because the file name can legitimately run to NAME_MAX on
+        # its own; with tempfile's random suffix on top, an untruncated prefix fails with
+        # ENAMETOOLONG for a target name that would itself have fit.
+        prefix = f".{target.name[:_TEMP_PREFIX_MAX_CHARS]}."
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=prefix, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            tmp.write(content)
+        if overwrite:
+            tmp_path.replace(target)
+        else:
+            # The caller's exists() check happens before the download, so exclusivity has
+            # to belong to this write: hardlink_to fails when the target appeared in the
+            # meantime, where replace() would silently clobber it.
+            target.hardlink_to(tmp_path)
+            tmp_path.unlink()
+    except OSError:
+        # delete=False, so without this every failed write strands a fragment in the
+        # user's own destination directory.
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def create_http_client(settings: Settings) -> httpx.AsyncClient:
@@ -1237,7 +1285,7 @@ class MattermostClient:
 
         Args:
             channel_id: Channel identifier
-            file_path: Path to the file to upload
+            file_path: Path to the file to upload. A leading ``~`` is expanded.
             filename: Custom filename (defaults to file_path basename)
 
         Returns:
@@ -1246,20 +1294,24 @@ class MattermostClient:
         Raises:
             FileValidationError: If file path is invalid or file doesn't exist
         """
-        from .exceptions import FileValidationError  # noqa: PLC0415
-
-        path = Path(file_path)
+        # Expanded for the same reason ``download_file`` expands its destination: agents
+        # phrase paths with ``~``. Without it, resolve(strict=True) below reports the
+        # unhelpful "Cannot resolve path: No such file or directory: '~'".
+        try:
+            path = Path(file_path).expanduser()  # noqa: ASYNC240 — CPU-bound, not blocking I/O
+        except RuntimeError as e:  # no home directory to expand against
+            raise FileValidationError(file_path, f"Cannot expand '~': {e}") from e
 
         # Resolve to absolute path to prevent TOCTOU race conditions.
         # Normalizes .. and . components.
         try:
-            resolved_path = path.resolve(strict=True)  # noqa: ASYNC240 — CPU-bound path resolution, not blocking I/O
+            resolved_path = path.resolve(strict=True)
         except (FileNotFoundError, OSError) as e:
             raise FileValidationError(file_path, f"Cannot resolve path: {e}") from e
 
         # Validate it's not a symlink (check original path before resolution)
         # Note: resolve() follows symlinks, so we check the original path
-        if path.is_symlink():  # noqa: ASYNC240 — CPU-bound stat check, not blocking I/O
+        if path.is_symlink():
             raise FileValidationError(file_path, "Symbolic links are not allowed")
 
         # Validate it's a regular file (not directory, device, etc.)
@@ -1334,6 +1386,45 @@ class MattermostClient:
         result = await self.get(f"/files/{file_id}/link")
         return result if isinstance(result, dict) else {}
 
+    async def _prepare_destination_dir(self, destination_dir: str) -> Path:
+        """Expand, resolve and create the directory a download will be written into.
+
+        No symlink check, deliberately. A symlinked *directory* is an ordinary way to put
+        downloads on another volume, and on macOS ``/tmp``, ``/var`` and ``/etc`` are
+        symlinks, so refusing them rejects obviously valid paths. It bought no safety
+        either: only the leaf was ever testable while ``resolve()`` follows symlinks in
+        every parent component, and anyone who can pass a symlink can pass its target
+        directly. What keeps the write inside the directory is the base-name-only rule in
+        ``download_file``.
+
+        Args:
+            destination_dir: Directory as the caller wrote it, ``~`` included
+
+        Returns:
+            The resolved, existing directory
+
+        Raises:
+            FileValidationError: If the path cannot be expanded, created, or is not a directory
+        """
+        # ``resolve()`` does not expand ``~`` and agents phrase destinations with it by
+        # default, so without this a "~/Downloads" lands in a directory literally named
+        # "~" under the CWD — silently, because the mkdir below then succeeds.
+        try:
+            target_dir = Path(destination_dir).expanduser()  # noqa: ASYNC240 — CPU-bound, not blocking I/O
+        except RuntimeError as e:  # no home directory to expand against
+            raise FileValidationError(destination_dir, f"Cannot expand '~': {e}") from e
+
+        try:
+            resolved_dir = target_dir.resolve()
+            await asyncio.to_thread(resolved_dir.mkdir, parents=True, exist_ok=True)
+        except OSError as e:
+            raise FileValidationError(destination_dir, f"Cannot use destination directory: {e}") from e
+
+        if not resolved_dir.is_dir():
+            raise FileValidationError(destination_dir, "Destination is not a directory")
+
+        return resolved_dir
+
     async def download_file(
         self,
         file_id: str,
@@ -1351,7 +1442,8 @@ class MattermostClient:
 
         Args:
             file_id: File identifier
-            destination_dir: Local directory to save into (created if missing)
+            destination_dir: Local directory to save into (created if missing).
+                A leading ``~`` is expanded.
             filename: Override the saved file name (defaults to the server-side name)
             overwrite: Replace an existing file with the same name
 
@@ -1362,16 +1454,7 @@ class MattermostClient:
             FileValidationError: If the destination or name is invalid, the file is
                 too large, or the target exists and ``overwrite`` is false
         """
-        target_dir = Path(destination_dir)
-        if target_dir.is_symlink():  # noqa: ASYNC240 — CPU-bound stat check, not blocking I/O
-            raise FileValidationError(destination_dir, "Symbolic links are not allowed")
-        try:
-            resolved_dir = target_dir.resolve()  # noqa: ASYNC240 — CPU-bound path resolution, not blocking I/O
-            await asyncio.to_thread(resolved_dir.mkdir, parents=True, exist_ok=True)
-        except OSError as e:
-            raise FileValidationError(destination_dir, f"Cannot use destination directory: {e}") from e
-        if not resolved_dir.is_dir():
-            raise FileValidationError(destination_dir, "Destination is not a directory")
+        resolved_dir = await self._prepare_destination_dir(destination_dir)
 
         info = await self.get_file_info(file_id)
         size = int(info.get("size") or 0)
@@ -1385,21 +1468,23 @@ class MattermostClient:
             raise FileValidationError(raw_name, "Invalid file name")
 
         target = resolved_dir / name
+        exists_msg = "File already exists (pass overwrite=True to replace it)"
+        # Cheap fail-fast so the download is skipped in the common case. It is not the
+        # guarantee, though — see the exclusive link in ``_write``.
         if target.exists() and not overwrite:
-            raise FileValidationError(str(target), "File already exists (pass overwrite=True to replace it)")
+            raise FileValidationError(str(target), exists_msg)
 
         content = await self._download_file_with_retry(file_id)
         if len(content) > MAX_DOWNLOAD_SIZE_BYTES:
             msg = f"Downloaded {len(content)} bytes, larger than the {MAX_DOWNLOAD_SIZE_BYTES} byte download limit"
             raise FileValidationError(file_id, msg)
 
-        def _write() -> None:
-            with tempfile.NamedTemporaryFile(dir=resolved_dir, prefix=f".{name}.", delete=False) as tmp:
-                tmp.write(content)
-                tmp_path = Path(tmp.name)
-            tmp_path.replace(target)
-
-        await asyncio.to_thread(_write)
+        try:
+            await asyncio.to_thread(_write_atomically, content, target, overwrite=overwrite)
+        except FileExistsError as e:  # subclass of OSError, so it has to be caught first
+            raise FileValidationError(str(target), exists_msg) from e
+        except OSError as e:
+            raise FileValidationError(str(target), f"Cannot write file: {e}") from e
 
         return {
             "file_id": file_id,

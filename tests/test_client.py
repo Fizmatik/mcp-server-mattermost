@@ -2064,6 +2064,37 @@ class TestMattermostClientFilesAPI:
                 assert "not a file" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_upload_file_expands_tilde(self, mock_settings, tmp_path, monkeypatch):
+        """upload_file() expands a leading ``~``, symmetrically with download_file().
+
+        Without it, ``resolve(strict=True)`` reports the unhelpful "Cannot resolve path:
+        No such file or directory: '~'" for a path a user would naturally write.
+        """
+        captured: list[httpx.Request] = []
+
+        def capture(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(201, json={"file_infos": [{"id": "file123"}]})
+
+        respx.post("https://test.mattermost.com/api/v4/files").mock(side_effect=capture)
+
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "report.pdf").write_bytes(b"pdf bytes")
+        monkeypatch.setenv("HOME", str(home))
+
+        from mcp_server_mattermost.config import get_settings
+
+        client = MattermostClient(get_settings())
+        async with client.lifespan():
+            await client.upload_file("ch123", "~/report.pdf")
+
+        assert len(captured) == 1
+        assert b"pdf bytes" in captured[0].content
+
+    @pytest.mark.asyncio
     async def test_upload_file_symlink_raises_error(self, mock_settings):
         """upload_file() should raise FileValidationError for symlink."""
         import tempfile
@@ -2407,6 +2438,131 @@ class TestMattermostClientFileDownload:
 
         assert content_route.call_count == 2
         assert result["size"] == 11
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_file_cleans_up_and_wraps_a_failed_write(self, mock_settings, tmp_path, monkeypatch):
+        """A failed write leaves no fragment behind and raises FileValidationError.
+
+        ``NamedTemporaryFile(delete=False)`` means an unguarded failure between creation
+        and the final link strands a ``.<name>.XXXXXXXX`` file in the user's own download
+        directory, and a raw OSError escapes a contract that declares only
+        FileValidationError.
+        """
+        from mcp_server_mattermost.exceptions import FileValidationError
+
+        respx.get(self.INFO_URL).mock(return_value=httpx.Response(200, json=self._info()))
+        respx.get(self.CONTENT_URL).mock(return_value=httpx.Response(200, content=b"%PDF-1.4 ok"))
+
+        def boom(self, target):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("pathlib.Path.hardlink_to", boom)
+
+        async with self._client().lifespan() as client:
+            with pytest.raises(FileValidationError, match="Cannot write file"):
+                await client.download_file(self.FILE_ID, str(tmp_path))
+
+        assert list(tmp_path.iterdir()) == [], "temp file left behind after a failed write"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_file_cleans_up_a_failed_overwrite(self, mock_settings, tmp_path, monkeypatch):
+        """The overwrite=True branch cleans up too, not just the exclusive-link one."""
+        from mcp_server_mattermost.exceptions import FileValidationError
+
+        respx.get(self.INFO_URL).mock(return_value=httpx.Response(200, json=self._info()))
+        respx.get(self.CONTENT_URL).mock(return_value=httpx.Response(200, content=b"new"))
+        (tmp_path / "report.pdf").write_bytes(b"old")
+
+        def boom(self, target):
+            raise OSError(21, "Is a directory")
+
+        monkeypatch.setattr("pathlib.Path.replace", boom)
+
+        async with self._client().lifespan() as client:
+            with pytest.raises(FileValidationError, match="Cannot write file"):
+                await client.download_file(self.FILE_ID, str(tmp_path), overwrite=True)
+
+        assert (tmp_path / "report.pdf").read_bytes() == b"old"
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".report.pdf.")], "temp file left behind"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_file_does_not_clobber_a_file_that_appeared_mid_download(
+        self,
+        mock_settings,
+        tmp_path,
+    ):
+        """A target created while the download was in flight must not be overwritten.
+
+        The exists() pre-check runs before the download, so with a plain os.replace the
+        no-overwrite guarantee holds only for the sequential case. Simulates the concurrent
+        one by creating the file from the response handler, i.e. during the fetch.
+        """
+        from mcp_server_mattermost.exceptions import FileValidationError
+
+        respx.get(self.INFO_URL).mock(return_value=httpx.Response(200, json=self._info()))
+
+        def create_target_then_respond(request: httpx.Request) -> httpx.Response:
+            (tmp_path / "report.pdf").write_bytes(b"winner")
+            return httpx.Response(200, content=b"loser")
+
+        respx.get(self.CONTENT_URL).mock(side_effect=create_target_then_respond)
+
+        async with self._client().lifespan() as client:
+            with pytest.raises(FileValidationError, match="already exists"):
+                await client.download_file(self.FILE_ID, str(tmp_path))
+
+        assert (tmp_path / "report.pdf").read_bytes() == b"winner"
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".report.pdf.")], "temp file left behind"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_file_accepts_symlinked_destination(self, mock_settings, tmp_path):
+        """A symlinked destination directory is valid and must not be refused.
+
+        Guards the deliberate absence of a symlink check: on macOS /tmp, /var and /etc are
+        symlinks, so rejecting them refuses obviously valid paths. Only the leaf was ever
+        testable anyway — ``resolve()`` follows symlinks in every parent component.
+        """
+        respx.get(self.INFO_URL).mock(return_value=httpx.Response(200, json=self._info()))
+        respx.get(self.CONTENT_URL).mock(return_value=httpx.Response(200, content=b"%PDF-1.4 ok"))
+
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real_dir, target_is_directory=True)
+
+        async with self._client().lifespan() as client:
+            result = await client.download_file(self.FILE_ID, str(link))
+
+        assert (real_dir / "report.pdf").read_bytes() == b"%PDF-1.4 ok"
+        assert result["path"] == str(real_dir / "report.pdf")
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_file_expands_tilde(self, mock_settings, tmp_path, monkeypatch):
+        """A leading ``~`` must reach the home directory, not a literal '~' under the CWD.
+
+        ``Path.resolve()`` does not expand it, so without ``expanduser`` the documented
+        "~/Downloads" example silently creates a directory named '~' in the process CWD
+        and reports success. Regression guard.
+        """
+        respx.get(self.INFO_URL).mock(return_value=httpx.Response(200, json=self._info()))
+        respx.get(self.CONTENT_URL).mock(return_value=httpx.Response(200, content=b"%PDF-1.4 ok"))
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.chdir(tmp_path)
+
+        async with self._client().lifespan() as client:
+            result = await client.download_file(self.FILE_ID, "~/Downloads")
+
+        assert result["path"] == str(home / "Downloads" / "report.pdf")
+        assert (home / "Downloads" / "report.pdf").read_bytes() == b"%PDF-1.4 ok"
+        assert not (tmp_path / "~").exists(), "created a directory literally named '~'"
 
     @pytest.mark.asyncio
     @respx.mock

@@ -250,6 +250,7 @@ async def test_collision_after_precheck(mock_settings, tmp_path, publication, mo
 @respx.mock
 async def test_mcp_rename_and_schema(mock_settings, tmp_path):
     from fastmcp import Client, FastMCP
+    from jsonschema import Draft202012Validator
 
     from mcp_server_mattermost.server import app_lifespan
     from mcp_server_mattermost.tools.files import download_file
@@ -264,7 +265,11 @@ async def test_mcp_rename_and_schema(mock_settings, tmp_path):
         tool = next(t for t in await client.list_tools() if t.name == "download_file")
         policy = tool.inputSchema["properties"]["on_conflict"]
         assert policy["default"] is None
-        assert any(set(option.get("enum", [])) == {"error", "rename", "overwrite"} for option in policy["anyOf"])
+        validator = Draft202012Validator(policy)
+        for value in ("error", "rename", "overwrite", None):
+            assert validator.is_valid(value), f"Schema rejected supported policy: {value!r}"
+        for value in ("invalid", "", True, 0, [], {}):
+            assert not validator.is_valid(value), f"Schema accepted invalid policy: {value!r}"
         assert "on_conflict" not in tool.inputSchema.get("required", [])
         for i, file_id in enumerate(identifiers):
             result = await client.call_tool(

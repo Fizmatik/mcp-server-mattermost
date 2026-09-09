@@ -133,6 +133,7 @@ class TestDownloadFile:
             destination_dir="/home/user/downloads",
             filename=None,
             overwrite=False,
+            on_conflict=None,
         )
 
     async def test_download_file_with_options(self, mock_client: AsyncMock) -> None:
@@ -158,4 +159,5 @@ class TestDownloadFile:
             destination_dir="/home/user/downloads",
             filename="renamed.pdf",
             overwrite=True,
+            on_conflict=None,
         )

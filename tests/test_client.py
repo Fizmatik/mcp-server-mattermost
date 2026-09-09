@@ -2330,7 +2330,7 @@ class TestMattermostClientFileDownload:
             "size": 11,
             "mime_type": "application/pdf",
         }
-        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".report.pdf.")], "temp file left behind"
+        assert list(tmp_path.iterdir()) == [saved]
 
     @pytest.mark.asyncio
     @respx.mock
@@ -2345,6 +2345,33 @@ class TestMattermostClientFileDownload:
 
         assert (target_dir / "renamed.bin").read_bytes() == b"data"
         assert result["name"] == "renamed.bin"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_file_accepts_long_multibyte_name(self, mock_settings, tmp_path, monkeypatch):
+        """A valid target name must not make the temporary name exceed a byte limit."""
+        import errno
+        import tempfile
+
+        filename = "😀" * 62
+        respx.get(self.INFO_URL).mock(return_value=httpx.Response(200, json=self._info(name=filename)))
+        respx.get(self.CONTENT_URL).mock(return_value=httpx.Response(200, content=b"unicode"))
+
+        named_temporary_file = tempfile.NamedTemporaryFile
+
+        def byte_limited_tempfile(*args, prefix="", **kwargs):
+            if len(f"{prefix}abcdefgh".encode()) > 255:
+                raise OSError(errno.ENAMETOOLONG, "File name too long")
+            return named_temporary_file(*args, prefix=prefix, **kwargs)
+
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", byte_limited_tempfile)
+
+        async with self._client().lifespan() as client:
+            result = await client.download_file(self.FILE_ID, str(tmp_path))
+
+        assert result["name"] == filename
+        assert (tmp_path / filename).read_bytes() == b"unicode"
+        assert list(tmp_path.iterdir()) == [tmp_path / filename]
 
     @pytest.mark.asyncio
     @respx.mock
@@ -2398,6 +2425,27 @@ class TestMattermostClientFileDownload:
         assert content_route.call_count == 0
         assert list(tmp_path.iterdir()) == []
 
+    @pytest.mark.parametrize("size", ["bad", {"bytes": 1}, [1]])
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_file_rejects_invalid_metadata_size(self, mock_settings, tmp_path, size):
+        """Malformed sizes raise a validation error before fetching file content."""
+        from mcp_server_mattermost.exceptions import FileValidationError
+
+        respx.get(self.INFO_URL).mock(return_value=httpx.Response(200, json=self._info(size=size)))
+        content_route = respx.get(self.CONTENT_URL).mock(return_value=httpx.Response(200, content=b"new"))
+        existing = tmp_path / "report.pdf"
+        existing.write_bytes(b"old")
+
+        async with self._client().lifespan() as client:
+            with pytest.raises(FileValidationError, match="Invalid file size in metadata") as exc_info:
+                await client.download_file(self.FILE_ID, str(tmp_path), overwrite=True)
+
+        assert isinstance(exc_info.value.__cause__, (TypeError, ValueError))
+        assert content_route.call_count == 0
+        assert existing.read_bytes() == b"old"
+        assert list(tmp_path.iterdir()) == [existing]
+
     @pytest.mark.asyncio
     @respx.mock
     async def test_download_file_destination_is_a_file(self, mock_settings, tmp_path):
@@ -2441,23 +2489,103 @@ class TestMattermostClientFileDownload:
 
     @pytest.mark.asyncio
     @respx.mock
+    async def test_download_file_falls_back_when_hard_links_are_unavailable(
+        self,
+        mock_settings,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A writable filesystem without hard links must still accept downloads."""
+        import errno
+
+        respx.get(self.INFO_URL).mock(return_value=httpx.Response(200, json=self._info()))
+        respx.get(self.CONTENT_URL).mock(return_value=httpx.Response(200, content=b"fallback"))
+
+        def unsupported(self, target):
+            raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+
+        monkeypatch.setattr("pathlib.Path.hardlink_to", unsupported)
+
+        async with self._client().lifespan() as client:
+            result = await client.download_file(self.FILE_ID, str(tmp_path))
+
+        saved = tmp_path / "report.pdf"
+        assert saved.read_bytes() == b"fallback"
+        assert result["path"] == str(saved)
+        assert list(tmp_path.iterdir()) == [saved]
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_download_file_fallback_does_not_clobber_a_concurrent_file(
+        self,
+        mock_settings,
+        tmp_path,
+        monkeypatch,
+    ):
+        """The fallback must retain no-overwrite semantics if the target appears."""
+        import errno
+
+        from mcp_server_mattermost.exceptions import FileValidationError
+
+        respx.get(self.INFO_URL).mock(return_value=httpx.Response(200, json=self._info()))
+        respx.get(self.CONTENT_URL).mock(return_value=httpx.Response(200, content=b"loser"))
+
+        def target_appears(self, target):
+            self.write_bytes(b"winner")
+            raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+
+        monkeypatch.setattr("pathlib.Path.hardlink_to", target_appears)
+
+        async with self._client().lifespan() as client:
+            with pytest.raises(FileValidationError, match="already exists"):
+                await client.download_file(self.FILE_ID, str(tmp_path))
+
+        assert (tmp_path / "report.pdf").read_bytes() == b"winner"
+        assert list(tmp_path.iterdir()) == [tmp_path / "report.pdf"]
+
+    @pytest.mark.asyncio
+    @respx.mock
     async def test_download_file_cleans_up_and_wraps_a_failed_write(self, mock_settings, tmp_path, monkeypatch):
-        """A failed write leaves no fragment behind and raises FileValidationError.
+        """A failed fallback write leaves no fragments and raises FileValidationError.
 
         ``NamedTemporaryFile(delete=False)`` means an unguarded failure between creation
-        and the final link strands a ``.<name>.XXXXXXXX`` file in the user's own download
-        directory, and a raw OSError escapes a contract that declares only
-        FileValidationError.
+        and publication strands a temporary file. The exclusive fallback can also leave a
+        partial target if its write fails after creation.
         """
+        import errno
+
         from mcp_server_mattermost.exceptions import FileValidationError
 
         respx.get(self.INFO_URL).mock(return_value=httpx.Response(200, json=self._info()))
         respx.get(self.CONTENT_URL).mock(return_value=httpx.Response(200, content=b"%PDF-1.4 ok"))
 
-        def boom(self, target):
-            raise OSError(28, "No space left on device")
+        def unsupported(self, target):
+            raise OSError(errno.EOPNOTSUPP, "Operation not supported")
 
-        monkeypatch.setattr("pathlib.Path.hardlink_to", boom)
+        path_open = type(tmp_path).open
+
+        class PartialWriter:
+            def __init__(self, target_file):
+                self.target_file = target_file
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self.target_file.close()
+
+            def write(self, content):
+                self.target_file.write(content[:1])
+                raise OSError(28, "No space left on device")
+
+        def fail_after_partial_write(self, *args, **kwargs):
+            target_file = path_open(self, *args, **kwargs)
+            if self == tmp_path / "report.pdf":
+                return PartialWriter(target_file)
+            return target_file
+
+        monkeypatch.setattr("pathlib.Path.hardlink_to", unsupported)
+        monkeypatch.setattr("pathlib.Path.open", fail_after_partial_write)
 
         async with self._client().lifespan() as client:
             with pytest.raises(FileValidationError, match="Cannot write file"):
@@ -2485,7 +2613,7 @@ class TestMattermostClientFileDownload:
                 await client.download_file(self.FILE_ID, str(tmp_path), overwrite=True)
 
         assert (tmp_path / "report.pdf").read_bytes() == b"old"
-        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".report.pdf.")], "temp file left behind"
+        assert list(tmp_path.iterdir()) == [tmp_path / "report.pdf"]
 
     @pytest.mark.asyncio
     @respx.mock

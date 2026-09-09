@@ -2,6 +2,7 @@
 
 import asyncio
 import http.cookiejar
+import os
 import tempfile
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -9,7 +10,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 import httpx
 from tenacity import RetryCallState, retry, retry_if_exception, stop_after_attempt, wait_exponential
@@ -33,9 +34,9 @@ from .logging import logger, request_id_var
 # against a server that misreports ``size``, not a guarantee about allocation.
 MAX_DOWNLOAD_SIZE_BYTES = 100 * 1024 * 1024
 
-# How much of a file's name goes into its temp file's prefix. Bounded so the prefix plus
-# tempfile's random suffix stays well inside NAME_MAX (255) for a long attachment name.
-_TEMP_PREFIX_MAX_CHARS = 100
+# Keep temporary names independent of the target name: filesystems commonly limit a
+# directory entry by encoded bytes rather than Unicode characters.
+_DOWNLOAD_TEMP_PREFIX = ".mattermost-download-"
 
 
 _F = TypeVar("_F", bound=Callable[..., Any])
@@ -118,45 +119,102 @@ def _wait_for_rate_limit(retry_state: RetryCallState) -> float:
     return float(wait_exponential(multiplier=1, min=1, max=10)(retry_state))
 
 
-def _write_atomically(content: bytes, target: Path, *, overwrite: bool) -> None:
-    """Write bytes to ``target`` via a temp file in the same directory, leaving no debris.
+def _write_exclusively(content: bytes, target: Path) -> None:
+    """Create ``target`` without overwriting and remove it if the write fails."""
+    target_file = None
+    try:
+        target_file = target.open("xb")
+        with target_file:
+            target_file.write(content)
+    except OSError:
+        if target_file is not None:
+            target.unlink(missing_ok=True)
+        raise
+
+
+def _download_name_limit(directory: Path) -> int:
+    """Get the filesystem name limit, using a conservative fallback if unavailable."""
+    fallback = 255
+    try:
+        limit = os.pathconf(directory, "PC_NAME_MAX")
+    except (AttributeError, OSError, ValueError):
+        return fallback
+    return limit if limit > 0 else fallback
+
+
+def _numbered_download_path(target: Path, number: int, limit: int) -> Path:
+    """Append a collision number, trimming the stem at character boundaries."""
+    suffix = f" ({number}){target.suffix}"
+    stem = target.stem
+    while stem and len(os.fsencode(stem + suffix)) > limit:
+        stem = stem[:-1]
+    if not stem:
+        raise FileValidationError(str(target), "Cannot fit a numbered file name within the filesystem name limit")
+    return target.with_name(stem + suffix)
+
+
+def _publish_download(content: bytes, temporary: Path, target: Path) -> None:
+    """Publish exclusively, treating directories and dangling symlinks as occupied."""
+    if os.path.lexists(target):
+        raise FileExistsError(str(target))
+    try:
+        target.hardlink_to(temporary)
+    except FileExistsError:
+        raise
+    except OSError:
+        # Exclusive creation works without hard links, but readers may see the
+        # write in progress rather than one atomic publication.
+        _write_exclusively(content, target)
+
+
+def _write_download(
+    content: bytes,
+    target: Path,
+    *,
+    on_conflict: Literal["error", "rename", "overwrite"],
+) -> Path:
+    """Publish downloaded bytes without clobbering unless explicitly allowed.
 
     Blocking; call it through ``asyncio.to_thread``.
 
     Args:
-        content: Bytes to write.
+        content: Downloaded bytes to write.
         target: Final path. Its parent must exist and is where the temp file is created,
             so the two always share a filesystem.
-        overwrite: Replace ``target`` if it exists. When false, an existing target is an
-            error rather than something to clobber.
+        on_conflict: Reject, rename, or replace an existing target.
+
+    Returns:
+        The actual path published, including any collision suffix.
 
     Raises:
-        FileExistsError: If ``target`` exists and ``overwrite`` is false.
+        FileExistsError: If ``target`` exists and the policy is error.
+        FileValidationError: If a numbered name cannot fit the filesystem limit.
         OSError: If the write or the rename fails.
     """
     tmp_path: Path | None = None
     try:
-        # The prefix is truncated because the file name can legitimately run to NAME_MAX on
-        # its own; with tempfile's random suffix on top, an untruncated prefix fails with
-        # ENAMETOOLONG for a target name that would itself have fit.
-        prefix = f".{target.name[:_TEMP_PREFIX_MAX_CHARS]}."
-        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=prefix, delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=_DOWNLOAD_TEMP_PREFIX, delete=False) as tmp:
             tmp_path = Path(tmp.name)
             tmp.write(content)
-        if overwrite:
+        if on_conflict == "overwrite":
             tmp_path.replace(target)
-        else:
-            # The caller's exists() check happens before the download, so exclusivity has
-            # to belong to this write: hardlink_to fails when the target appeared in the
-            # meantime, where replace() would silently clobber it.
-            target.hardlink_to(tmp_path)
-            tmp_path.unlink()
-    except OSError:
-        # delete=False, so without this every failed write strands a fragment in the
-        # user's own destination directory.
+            return target
+        candidate = target
+        number = 0
+        limit = _download_name_limit(target.parent) if on_conflict == "rename" else 0
+        while True:
+            try:
+                _publish_download(content, tmp_path, candidate)
+            except FileExistsError:  # noqa: PERF203 — each race requires trying a new name
+                if on_conflict != "rename":
+                    raise
+                number += 1
+                candidate = _numbered_download_path(target, number, limit)
+            else:
+                return candidate
+    finally:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
-        raise
 
 
 def create_http_client(settings: Settings) -> httpx.AsyncClient:
@@ -1432,13 +1490,17 @@ class MattermostClient:
         filename: str | None = None,
         *,
         overwrite: bool = False,
+        on_conflict: Literal["error", "rename", "overwrite"] | None = None,
     ) -> dict[str, Any]:
         """Download a file attachment and save it under a local directory.
 
         The file's metadata is fetched first to learn its name and size; the
-        content is then written atomically (temp file + rename) into
-        ``destination_dir``. Only the base name is ever used, so a server-side
-        name like ``../x`` cannot escape the directory.
+        content is then written into ``destination_dir`` without overwriting by
+        default. New-file publication is atomic when hard links are available and
+        otherwise uses exclusive creation; requested overwrites use atomic
+        replacement. The rename policy retries occupied names with numbered
+        suffixes and returns the actual saved path. Only the base name is ever used, so a server-side name like
+        ``../x`` cannot escape the directory.
 
         Args:
             file_id: File identifier
@@ -1446,18 +1508,29 @@ class MattermostClient:
                 A leading ``~`` is expanded.
             filename: Override the saved file name (defaults to the server-side name)
             overwrite: Replace an existing file with the same name
+            on_conflict: Conflict policy. None uses the legacy overwrite flag.
+                Rename saves another copy under a numbered name on each collision.
 
         Returns:
             Dict with ``file_id``, ``path``, ``name``, ``size`` and ``mime_type``
 
         Raises:
-            FileValidationError: If the destination or name is invalid, the file is
-                too large, or the target exists and ``overwrite`` is false
+            FileValidationError: If the conflict options, destination, name, or
+                metadata size are invalid, the file is too large, a write fails, or the target exists
+                under the error policy.
         """
+        if on_conflict is not None and on_conflict not in {"error", "rename", "overwrite"}:
+            raise FileValidationError(file_id, "Invalid on_conflict: expected error, rename, or overwrite")
+        if overwrite and on_conflict in {"error", "rename"}:
+            raise FileValidationError(file_id, "overwrite=True conflicts with on_conflict=" + str(on_conflict))
+        policy = on_conflict if on_conflict is not None else ("overwrite" if overwrite else "error")
         resolved_dir = await self._prepare_destination_dir(destination_dir)
 
         info = await self.get_file_info(file_id)
-        size = int(info.get("size") or 0)
+        try:
+            size = int(info.get("size") or 0)
+        except (TypeError, ValueError) as e:
+            raise FileValidationError(file_id, "Invalid file size in metadata") from e
         if size > MAX_DOWNLOAD_SIZE_BYTES:
             msg = f"File is {size} bytes, larger than the {MAX_DOWNLOAD_SIZE_BYTES} byte download limit"
             raise FileValidationError(file_id, msg)
@@ -1468,10 +1541,10 @@ class MattermostClient:
             raise FileValidationError(raw_name, "Invalid file name")
 
         target = resolved_dir / name
-        exists_msg = "File already exists (pass overwrite=True to replace it)"
+        exists_msg = "File already exists (use on_conflict='rename' to keep both, or overwrite=True to replace it)"
         # Cheap fail-fast so the download is skipped in the common case. It is not the
-        # guarantee, though — see the exclusive link in ``_write``.
-        if target.exists() and not overwrite:
+        # guarantee, though — publication must still be exclusive.
+        if policy == "error" and await asyncio.to_thread(os.path.lexists, target):
             raise FileValidationError(str(target), exists_msg)
 
         content = await self._download_file_with_retry(file_id)
@@ -1480,7 +1553,7 @@ class MattermostClient:
             raise FileValidationError(file_id, msg)
 
         try:
-            await asyncio.to_thread(_write_atomically, content, target, overwrite=overwrite)
+            target = await asyncio.to_thread(_write_download, content, target, on_conflict=policy)
         except FileExistsError as e:  # subclass of OSError, so it has to be caught first
             raise FileValidationError(str(target), exists_msg) from e
         except OSError as e:
@@ -1489,7 +1562,7 @@ class MattermostClient:
         return {
             "file_id": file_id,
             "path": str(target),
-            "name": name,
+            "name": target.name,
             "size": len(content),
             "mime_type": str(info.get("mime_type") or ""),
         }

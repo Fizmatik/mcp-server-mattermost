@@ -56,6 +56,8 @@ EXPECTED_CAPABILITIES: dict[str, Capability] = {
     "update_bookmark_sort_order": Capability.WRITE,
 }
 
+DESTRUCTIVE_WRITE_TOOLS = {"download_file"}
+
 
 @pytest.fixture
 async def all_tools(mock_settings):
@@ -130,7 +132,10 @@ class TestCapabilityAnnotationConsistency:
             assert read_only is True, f"{tool_name}: capability=read but readOnlyHint={read_only}"
         elif expected_cap in (Capability.WRITE, Capability.CREATE):
             assert read_only is not True, f"{tool_name}: capability={expected_cap} but readOnlyHint=True"
-            assert destructive is False, f"{tool_name}: capability={expected_cap} but destructiveHint={destructive}"
+            if tool_name in DESTRUCTIVE_WRITE_TOOLS:
+                assert destructive is not False, f"{tool_name}: destructive write but destructiveHint=False"
+            else:
+                assert destructive is False, f"{tool_name}: capability={expected_cap} but destructiveHint={destructive}"
         elif expected_cap == Capability.DELETE:
             assert read_only is not True, f"{tool_name}: capability=delete but readOnlyHint=True"
             # delete tools use default annotations (destructiveHint defaults to true)
